@@ -1,0 +1,264 @@
+;**********************
+;Aaron Fainman 1386259
+;ELEN2006 Project
+;
+;*********************
+;Gap Sensor 1 --> INT0 ==> game starts
+;Ring touches wire --> PCINT20 ==> penalty
+;Gap Sensor 2 --> INT1 ==> game ends
+;**********************
+;Port Description
+; :|7|6|5|4|3|2|1|0|
+;B:|-|-|P|W|T|T|T|T|	W: Warning/Orange LED for when score jumps over multiple of 10 (output)
+;						P: Red led for when ring touches wire (output)
+;						U: Binary representation of the (decimal) score's unit values(output)
+;						SCORE_TENS functions as PORTB in code
+; :|7|6|5|4|3|2|1|0|
+;C:|-|-|-|-|U|U|U|U|	T: Binary representation of the (decimal) score's ten values (output)
+;D:|-|B|-|P|E|S|-|-|	B: PWM to buzzer (output)
+;						P: Penalty, ring touched wire (input/interrupt)
+;						E: Game ends (input/interrupt)
+;						S: Game starts (input/interrupt)
+;***********************
+
+.DEF SCORE_UNITS=R20
+.DEF SCORE_TENS=R21
+.DEF NUM_SECONDS=R22
+.DEF ROUND=R23
+
+.EQU PENALTY = 2	;Choose severity for touching wire. 0<=Penalty<=10
+
+
+.ORG 0x0000
+	JMP SETUP
+.ORG 0x0002
+	JMP PROGRAM_START
+.ORG 0x0004
+	JMP PROGRAM_END
+.ORG 0x000A
+	JMP WIRE_TOUCH
+.ORG 0x0016
+	JMP TIMER1A_MATCH
+.ORG 0x002A
+	JMP ADC_COMPLETE
+
+
+SETUP:
+	;Setup ports for input/output:
+	LDI R16, 0xFF
+	OUT DDRB, R16	;Set every PORTB pin to output
+	LDI R16, 0B00011111
+	OUT DDRC, R16	;Set pin5 (7-5) of PORTCto input, rest to output
+
+	LDI R16, 0B01000000	;OC0A (PD6) is an output pin, rest is input
+	OUT DDRD, R16
+
+	;Setup external interrupts INT0/INT1:
+	LDI R16, (0<<ISC11)|(1<<ISC10)|(1<ISC01)|(1<<ISC00)	;Rising edge of INT0, and INT1 interrupts
+	STS EICRA, R16
+
+	CLR R16
+	LDI R16, (0<<INT1)|(1<<INT0)	;Enable interrupts for INT0, disable temporarily for INT1
+	OUT EIMSK, R16
+
+	;Setup TIMER1
+	CLR R16
+	STS TCCR1A, R16		;Normal port operation for OC1A, OC1B
+	LDI R16, (1<<WGM12)|(1<<CS12)|(0<<CS11)|(1<<CS10)	;CTC, Prescale clock by 1024
+	STS TCCR1B, R16
+
+	LDI R16, 0x7F	;3D09 for 1 second, 0x107F for quarter seconds
+	LDI R17, 0x10	
+	STS OCR1AH, R17
+	STS OCR1AL, R16
+
+	;Setup PCINT
+	CLR R16
+	LDI R16, (1<<PCIE2)	
+	STS PCICR, R16		;Setup PCINT20 (PD4) as interrupt for wire touch penalty
+
+	;SETUP ADC
+	CLR R16
+	LDI R16, (0<<REFS1)|(1<<REFS0)|(1<<ADLAR)|(0<<MUX3)|(1<<MUX2)|(0<<MUX1)|(1<<MUX0) ;internal Vref, left adjusted data , input to PC5
+	STS ADMUX, R16
+
+	CLR R16
+	LDI R16, (1<<ADEN)|(1<<ADSC)|(1<<ADATE)|(1<<ADIE)|(1<<ADPS2)|(1<ADPS1)|(1<<ADPS0)	
+	;enable interrupts, start conversion, free running ADC, prescale by 128
+	STS ADCSRA, R16
+
+	;Turn off red and orangle LEDS
+	SBI PORTB, 4
+	SBI PORTB, 5
+
+	;Clear special registers
+	CLR ROUND
+	CLR SCORE_UNITS
+	CLR SCORE_TENS
+
+	SEI	;enable global interrupts
+
+MAIN:
+	RJMP MAIN
+
+
+
+PROGRAM_START:
+	;Clear and output registers containing scores 
+	CLR SCORE_UNITS	
+
+	LDI SCORE_TENS, 0B00110000	;clear score, red and orange LEDS off
+	OUT PORTC, SCORE_UNITS
+	OUT PORTB, SCORE_TENS
+
+	CLR R16
+	STS ADCSRA, R16	;Stop ADC 
+
+	STS TCNT1L, R16		;Clear TIMER1
+	STS TCNT1H, R16
+
+	LDI R16, (1<<OCIE1A)	;Enable TIMER1A interrupts
+	STS TIMSK1, R16
+
+	CLR R16
+	LDI R16, (1<<INT1)|(1<<INT0)	;Enable interrupts for INT0, INT1 (game start and end)
+	OUT EIMSK, R16
+
+	CLR R16
+	LDI R16, (1<<PCINT20)
+	STS PCMSK2, R16		;Enable PCINT20 interrupts for wire touch penalty
+
+	;Setup PWM for speaker
+	CLR R16
+	LDI R16, (0<<COM0A1)|(1<<COM0A0)|(1<<WGM01)|(0<<WGM00)	;Toggle OC0A on compare,
+	OUT TCCR0A, R16
+	CLR R16
+	LDI R16, (1<<WGM02)|(1<<CS02)|(0<<CS01)|(1<<CS00)	;WGM:101 Phase Correct PWM to OCR0A
+	OUT TCCR0B, R16
+
+	LDI R16, 120	
+	OUT OCR0A, R16		;compare TIMER0 to 120
+
+	RETI
+
+
+PROGRAM_END:
+	CLR R16
+	STS TIMSK1, R16	;Disable timer1A interrupts
+	STS PCMSK2, R16	;Disable PCINT20 interrupts (wire touch penalty)
+	LDI R16, (0<<INT1)|(1<<INT0)	;Disable interrupt for game end
+	OUT EIMSK, R16
+
+	SBI PORTB, 5	;turn off red LED
+	SBI PORTB, 4	;turn offorange LED
+
+	CLR R16
+	LDI R16, (0<<COM0A1)|(0<<COM0A0)|(1<<WGM01)|(1<<WGM00)	;Normal OC0A port operation ie. turn off buzzer
+	OUT TCCR0A, R16
+
+	CLR R16
+	LDI R16, (1<<ADEN)|(1<<ADSC)|(1<<ADATE)|(1<<ADIE)|(1<<ADPS2)|(1<ADPS1)|(1<<ADPS0)	;start ADC conversion
+	STS ADCSRA, R16
+
+	RETI
+
+WIRE_TOUCH:
+	CBR SCORE_TENS, 0B00100000	;turn on RED LED
+	SBR SCORE_TENS, 0B00010000	;turn off orange LED
+
+	CLR R16
+	STS PCMSK2, R16		;Temporarily disable PCINT20 interrupts for wire touch penalty
+
+	;If Score>=(99-PENALTY), set score to 99, end game
+	LDI R16, 10
+	SUBI R16, PENALTY
+	CP SCORE_UNITS, R16
+	BRLO PC+6
+	CPI SCORE_TENS, 0B00011001
+	BRLO PC+4
+	LDI SCORE_UNITS, 9
+	OUT PORTC, SCORE_UNITS
+	RJMP PROGRAM_END
+
+	;Update score but keep in units and tens format
+	PUSH SCORE_UNITS	;keep previous score for later use
+	LDI R16, PENALTY
+	LDI R17, 0x0A
+	ADD SCORE_UNITS, R16
+	CP SCORE_UNITS, R17
+	BRLO PC+4	;If SCORE_UNITS>10 ==> inc SCORE_TENS and subtract 10 from SCORE_UNITS
+	SUBI SCORE_UNITS, 0x0A
+	INC SCORE_TENS
+	SBR SCORE_TENS, 0B00100000
+	
+	;Turn on orange LED if score incremented to/above multiple of 10
+	POP R16		;pop previous score into R16 for comparison
+	CP SCORE_UNITS, R16
+	BRSH PC+2						;if previous SCORE_UNITS_PAST>SCORE_UNITS ==> score has incremented past a multiple of 10 ==> orange LED
+	CBR SCORE_TENS, 0B00110000
+
+	;Output score and necessary LEDS
+	OUT PORTC, SCORE_UNITS
+	OUT PORTB, SCORE_TENS
+
+	;Increase pitch of speaker
+	IN R16, OCR0A
+	DEC R16
+	OUT OCR0A, R16
+
+	RETI
+
+	
+	
+TIMER1A_MATCH:
+	;Ensure ARDUINO is in "default" game mode ie. interrupts enabled and LEDs off
+	CLR R16
+	LDI R16, (1<<PCINT20)
+	STS PCMSK2, R16		;Enable PCINT20 interrupts for wire touch penalty
+	SBR SCORE_TENS, 0B00110000	;Turn off orange, red LEDs
+	OUT PORTB, SCORE_TENS
+
+	;Only proceed with incrementing score if correct number of seconds has elapsed, else return
+	INC ROUND				
+	CP ROUND, NUM_SECONDS
+
+	BREQ PC+2
+	RETI
+	CLR ROUND
+
+	;End game if score==99
+	CPI SCORE_UNITS, 9
+	BRNE PC+4
+	CPI SCORE_TENS, 0B00111001
+	BRNE PC+2
+	JMP PROGRAM_END
+
+	;Update score
+	LDI R17, 0x0A
+	INC SCORE_UNITS
+	CP SCORE_UNITS, R17
+	BRNE PC+4	;If SCORE_UNITS==10 ==> inc SCORE_TENS and subtract 10 from SCORE_UNITS
+	SUBI SCORE_UNITS, 0x0A
+	INC SCORE_TENS
+	CBR SCORE_TENS, 0B00010000
+	;Output score and necessary LEDs
+	OUT PORTC, SCORE_UNITS
+	OUT PORTB, SCORE_TENS
+
+	;Increase pitch of speaker
+	IN R16, OCR0A
+	DEC R16
+	OUT OCR0A, R16
+
+	RETI
+
+ADC_COMPLETE:
+	LDS NUM_SECONDS, ADCL
+	LDS NUM_SECONDS, ADCH	;Read in (left-adjusted score)
+
+	ANDI NUM_SECONDS, 0B11100000	;only need three digits --> gives 7 possible values
+	SWAP NUM_SECONDS
+	CPI NUM_SECONDS, 0		;if==0, inc by one
+	BRNE PC+2
+	INC NUM_SECONDS
+	RETI
